@@ -1,0 +1,431 @@
+# Design Document: KYC Single-Page Redesign
+
+## Overview
+
+This design replaces the existing 5-step multi-page KYC flow with a single-page form. The current flow collects personal details, address details, contact/document uploads, and declarations across separate steps with individual API calls per step (`PERSONAL_INFO_SUBMITTED`, `ADDRESS_INFO_SUBMITTED`, `CONTACT_INFO_SUBMITTED`, `DOCUMENTS_SUBMITTED`, `KYC_FORM_SUBMITTED`). The redesign consolidates all fields onto one page and submits everything in a single API call using a new event type `SINGLE_PAGE_KYC_SUBMITTED`.
+
+The simplified field set is: Phone, Email, First Name, Middle Name, Last Name, PAN Number, State, PAN Card (ID proof), and Address Proof (conditional alternative document upload). All legacy fields (father/spouse name, DOB, gender, marital status, nationality, residential status, occupation, annual income, net worth, PEP status, Aadhaar number, full address breakdown) are dropped from the new form but preserved in the data model for backward compatibility with existing records.
+
+### Key Design Decisions
+
+1. **New event type `SINGLE_PAGE_KYC_SUBMITTED`** rather than reusing `KYC_FORM_SUBMITTED` — this cleanly separates the new single-page submission path from the legacy multi-step path, allowing both to coexist without conditional branching in the existing step handlers.
+
+2. **Reuse existing `KycPersonalInfo`, `AddressInfo`, `KycContactInfo`, `KycDocumentInfo` structures** — the new submission populates these same interfaces with the simplified field set and constructs `fullName` from first/middle/last name parts. Legacy-only fields are left undefined. This means the RA dashboard, eSignature flow, and approval/rejection flows continue working without modification.
+
+3. **Legacy detection via presence of `dateOfBirth` or `gender` in `personalInfo`** — the KYC Details page uses this heuristic to decide whether to render the full legacy layout or the simplified layout. No backend schema changes or version flags are needed.
+
+4. **Reuse `KYC_AADHAR_CARD` presigned URL type for alternative address proof** — the existing Aadhaar bucket (`ipier-kyc-documents`) is reused for storing alternative address proof documents, avoiding new S3 bucket provisioning.
+
+## Architecture
+
+The change touches three layers of the system:
+
+```mermaid
+graph TD
+    subgraph Frontend ["Frontend (React SPA)"]
+        KF[KYCForm.js - Single Page]
+        KD[KYCDetails.js - RA View]
+    end
+
+    subgraph Backend ["Backend (IPierWebControllers Lambda)"]
+        UC[update-kyc-controller.ts]
+        KS[kyc-service.ts]
+        KNS[kyc-notification-service.ts]
+        KM[kyc.model.ts]
+    end
+
+    subgraph Notification ["Notification Service (Java Lambda)"]
+        SES[SesEmailSender.java]
+        WA1[KycSubmissionWhatsAppBodyBuilder.java]
+        WA2[ESignCompleteWhatsAppBodyBuilder.java]
+    end
+
+    subgraph Storage ["AWS Storage"]
+        DDB[(DynamoDB - KYC Metadata)]
+        S3[(S3 - KYC Documents)]
+        SQS[(SQS - Notification Queue)]
+    end
+
+    KF -->|POST /kyc/update| UC
+    UC -->|SINGLE_PAGE_KYC_SUBMITTED| KS
+    KS --> DDB
+    KS --> S3
+    KS -->|SQS message| SQS
+    SQS --> SES
+    SQS --> WA1
+    SQS --> WA2
+    KD -->|GET /kyc/:id| DDB
+```
+
+### Submission Flow
+
+```mermaid
+sequenceDiagram
+    participant Investor
+    participant KYCForm
+    participant PresignedURL
+    participant S3
+    participant UpdateKYC
+    participant KycService
+    participant DynamoDB
+    participant SQS
+    participant NotificationLambda
+
+    Investor->>KYCForm: Fill all fields on single page
+    KYCForm->>PresignedURL: Request PAN card upload URL
+    PresignedURL-->>KYCForm: Presigned URL (KYC_PAN_CARD)
+    KYCForm->>S3: Upload PAN card file
+    
+    opt Address mismatch
+        KYCForm->>PresignedURL: Request address proof upload URL
+        PresignedURL-->>KYCForm: Presigned URL (KYC_AADHAR_CARD)
+        KYCForm->>S3: Upload address proof file
+    end
+
+    Investor->>KYCForm: Click "Submit KYC"
+    KYCForm->>UpdateKYC: POST {eventType: SINGLE_PAGE_KYC_SUBMITTED, ...fields}
+    UpdateKYC->>KycService: submitSinglePageKyc(request)
+    KycService->>KycService: Validate all required fields
+    KycService->>KycService: Construct fullName, populate KycData structures
+    KycService->>DynamoDB: Update KYC metadata (status=IN_REVIEW)
+    KycService->>KycService: Generate invoice PDF
+    KycService->>SQS: Send notification message
+    KycService-->>UpdateKYC: {success: true, status: IN_REVIEW}
+    UpdateKYC-->>KYCForm: 200 OK
+    SQS->>NotificationLambda: Process notification
+    NotificationLambda->>NotificationLambda: Send RA email + WhatsApp + client email
+```
+
+## Components and Interfaces
+
+### 1. Frontend: KYCForm.js (Single-Page Rewrite)
+
+**Current state:** Multi-step form with 4-5 steps, step navigation, per-step API calls.
+
+**New state:** Single-page form with all fields visible, one "Submit KYC" button, one API call.
+
+#### Component Props (unchanged)
+```javascript
+KYCForm = ({
+  onSubmitSuccess, onSubmitError,
+  initialEmail, initialPhone, initialFirstName, initialLastName,
+  contactMethod, kycId, initialKycData, analystContact, orderId
+})
+```
+
+#### Form State (simplified)
+```javascript
+const [formData, setFormData] = useState({
+  phoneNumber: initialPhone || '',
+  email: initialEmail || '',
+  firstName: initialFirstName || '',
+  middleName: '',
+  lastName: initialLastName || '',
+  panNumber: '',
+  state: '',
+  panCardFile: null,           // File object for PAN card
+  panCardS3Key: '',            // S3 key after upload
+  addressMatchesPan: true,     // Checkbox: PAN address matches current address
+  altAddressProofType: '',     // Alternative document type
+  altAddressProofFile: null,   // File object for alt address proof
+  altAddressProofS3Key: '',    // S3 key after upload
+});
+```
+
+#### Validation Rules
+| Field | Rule | Error Message |
+|-------|------|---------------|
+| Phone | `^[6-9]\d{9}$` | "Mobile number must be 10 digits starting with 6-9" |
+| Email | `^[^\s@]+@[^\s@]+\.[^\s@]+$` | "Please enter a valid email address" |
+| First Name | Required, `^[A-Za-z\s]+$` | "First name is required" / "Only letters and spaces allowed" |
+| Middle Name | Optional, `^[A-Za-z\s]*$` | "Only letters and spaces allowed" |
+| Last Name | Required, `^[A-Za-z\s]+$` | "Last name is required" / "Only letters and spaces allowed" |
+| PAN | `^[A-Z]{5}[0-9]{4}[A-Z]{1}$` (auto-uppercase) | "PAN must be in format: ABCDE1234F" |
+| State | Required (dropdown) | "State selection is required" |
+| PAN Card File | Required, JPEG/PNG/PDF, ≤10MB | "ID proof upload is required" / "File must be JPEG, PNG, or PDF under 10MB" |
+| Alt Address Proof | Required when `addressMatchesPan` is false | "Alternative address proof is required" |
+
+#### Submission Payload
+```typescript
+{
+  eventType: 'SINGLE_PAGE_KYC_SUBMITTED',
+  kycId: string,
+  firstName: string,
+  middleName?: string,
+  lastName: string,
+  panNumber: string,
+  state: string,
+  phoneNumber: string,
+  email: string,
+  panCardDocumentS3Key: string,
+  addressMatchesPan: boolean,
+  altAddressProofDocumentType?: string,  // 'UTILITY_BILL' | 'PROPERTY_TAX_RECEIPT' | 'PENSION_PAYMENT_ORDER' | 'EMPLOYER_ACCOMMODATION_LETTER'
+  altAddressProofDocumentS3Key?: string,
+}
+```
+
+### 2. Backend: kyc.model.ts Updates
+
+#### New Event Type
+```typescript
+// Add to KycEventType enum
+SINGLE_PAGE_KYC_SUBMITTED = 'SINGLE_PAGE_KYC_SUBMITTED',
+```
+
+#### New Alternative Address Proof Document Types
+```typescript
+// Add to AddressProofDocumentType enum
+PROPERTY_TAX_RECEIPT = 'PROPERTY_TAX_RECEIPT',
+PENSION_PAYMENT_ORDER = 'PENSION_PAYMENT_ORDER',
+EMPLOYER_ACCOMMODATION_LETTER = 'EMPLOYER_ACCOMMODATION_LETTER',
+```
+
+#### Extended KycUpdateRequest
+```typescript
+// Add optional fields to KycUpdateRequest interface
+firstName?: string;
+middleName?: string;
+lastName?: string;
+panNumber?: string;
+state?: string;
+phoneNumber?: string;
+email?: string;
+panCardDocumentS3Key?: string;
+addressMatchesPan?: boolean;
+altAddressProofDocumentType?: string;
+altAddressProofDocumentS3Key?: string;
+```
+
+### 3. Backend: update-kyc-controller.ts
+
+Add a new case to the switch statement:
+```typescript
+case KycEventType.SINGLE_PAGE_KYC_SUBMITTED:
+    result = await kycService.submitSinglePageKyc(updateRequest);
+    break;
+```
+
+### 4. Backend: kyc-service.ts — New `submitSinglePageKyc` Method
+
+This method handles the entire single-page submission in one call. It:
+
+1. Validates the KYC is in a valid state (same allowed sub-statuses as `submitDeclarations`)
+2. Validates all required fields are present
+3. Constructs `fullName` from first + middle + last name
+4. Populates `KycPersonalInfo` with `fullName` and `panNumber` (legacy fields left undefined)
+5. Populates `AddressInfo` with `state` only (in `communicationAddress`)
+6. Populates `KycContactInfo` with `email` and `phoneNumber`
+7. Populates `KycDocumentInfo` with PAN card S3 key and address proof logic
+8. Sets status to `IN_REVIEW`, subStatus to `KYC_RA_VERIFICATION_PENDING`
+9. Syncs contact data to userAttributes (same as existing `submitDeclarations`)
+10. Generates invoice, sends notifications, updates order status
+11. Creates audit event
+
+#### Field Mapping to Existing Structures
+
+```
+firstName + middleName + lastName → KycPersonalInfo.fullName
+panNumber → KycPersonalInfo.panNumber
+state → AddressInfo.state (communicationAddress)
+email → KycContactInfo.email
+phoneNumber → KycContactInfo.phoneNumber
+panCardDocumentS3Key → KycDocumentInfo.panCardDocumentS3Key
+addressMatchesPan → KycDocumentInfo.isAadhaarAddressCurrent
+altAddressProofDocumentS3Key → KycDocumentInfo.aadhaarCardDocumentS3Key
+altAddressProofDocumentType → KycDocumentInfo.addressProofDocumentType
+
+When addressMatchesPan is true:
+  KycDocumentInfo.aadhaarCardDocumentS3Key = panCardDocumentS3Key (copy)
+  KycDocumentInfo.isAadhaarAddressCurrent = true
+```
+
+### 5. Backend: kyc-notification-service.ts Updates
+
+#### `buildKycSubmissionNotificationParams` Changes
+
+**Keep:** orderId, orderSubmissionDateTime, orderLinkForRa, orderLinkForClient, clientPhone, clientEmail, notifyClientByEMAIL, notifyClientBySMS, raWhatsAppNumber, raEmail, raName, planName, clientName, fullName, panNo, panFileBucket, panFileKey, panFileType, aadharFileBucket, aadharFileKey, aadharFileType, invoiceFileBucket, invoiceFileKey, invoiceFileType
+
+**Add:** state (from `communicationAddress.state`)
+
+**Remove:** fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, pep, aadhar, currentAddress
+
+#### `buildEsignCompletedNotificationParams` Changes
+
+Same pattern: keep common fields, add `state`, remove legacy personal info fields.
+
+### 6. Java Notification Service: SesEmailSender.java
+
+#### `sendRaKycSubmitted` Method Changes
+
+**Remove** population of: fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, netWorth, pep, aadharLast4, currentAddress, permanentAddress
+
+**Add:** state, clientPhone, clientEmail
+
+**Keep:** fullName, panNo, planName, raName, and all attachment logic
+
+#### `sendRaESignComplete` Method Changes
+
+Same simplification — remove legacy fields, add state.
+
+#### `sendClientKycSubmitted` Method — Minimal Change
+
+Already only uses clientName, orderId, orderLinkForClient. No fields to remove.
+
+### 7. Java Notification Service: WhatsApp Body Builders
+
+**No changes needed.** Both `KycSubmissionWhatsAppBodyBuilder` and `ESignCompleteWhatsAppBodyBuilder` only use `planName`, `orderId`, `fullName`, and `clientPhone` — all of which remain in the simplified notification params. They already have null-safe defaults.
+
+### 8. Frontend: KYCDetails.js Updates
+
+#### Legacy Detection Logic
+```javascript
+const isLegacyKyc = (kycData) => {
+  const pi = kycData?.kycData?.personalInfo;
+  return !!(pi?.dateOfBirth || pi?.gender || pi?.aadhaarNumber);
+};
+```
+
+#### `transformApiDataToDisplayFormat` Changes
+
+Add `isLegacy` flag to the returned object. For simplified records, map only the available fields.
+
+#### Conditional Rendering
+
+- **Personal Info section:** Show full name, PAN, phone (with badge), email (with badge) for simplified. Show all legacy fields for legacy records.
+- **Address section:** Show only state for simplified. Show full correspondence/permanent address for legacy.
+- **Documents section:** Show PAN card and address proof buttons (unchanged).
+- **Declarations section:** Hide entirely for simplified records (no declaration fields populated). Show for legacy records.
+
+### 9. SES Email Templates (AWS SES)
+
+The following SES templates need updating:
+
+| Template | Change |
+|----------|--------|
+| `RaMailOnKycSubmissionTemplate` | Remove legacy field placeholders, add state, keep attachments |
+| `RaMailOnESignCompleteTemplate` | Remove legacy field placeholders, add state, keep attachments |
+| `ClientKycSubmittedEmailTemplate` | No change needed (already uses only clientName, orderId, orderLink) |
+
+
+## Data Models
+
+### KYC Metadata (DynamoDB) — No Schema Change
+
+The existing `KycMetadata` DynamoDB table schema is unchanged. The new single-page form populates the same `kycData` nested structure with a subset of fields:
+
+```typescript
+// Existing KycMetadata record — populated by single-page form
+{
+  kycId: "kyc-abc123",
+  analystHandle: "analyst-handle",
+  analystId: "analyst-id",
+  subscriptionId: "sub-plan-001",
+  orderId: "order-001",
+  userId: "cognito-sub-uuid",
+  userEmail: "investor@example.com",
+  userPhoneNumber: "+919876543210",
+  contactMethod: "mobile",
+  status: "IN_REVIEW",
+  subStatus: "KYC_RA_VERIFICATION_PENDING",
+  lastEventType: "SINGLE_PAGE_KYC_SUBMITTED",
+  kycStartTime: "20250115120000",
+  lastUpdatedTime: "20250115121500",
+  hashKey: "investor@example.com",
+  sortKey: "20250115##kyc-abc123",
+
+  kycData: {
+    kycId: "kyc-abc123",
+    personalInfo: {
+      fullName: "Avinash Kumar Singh",    // Constructed from first + middle + last
+      panNumber: "ABCDE1234F",
+      // All other fields (fatherOrSpouseName, dateOfBirth, gender, etc.) are undefined
+    },
+    communicationAddress: {
+      state: "Maharashtra",
+      // All other fields (addressLine1, city, postalCode, etc.) are undefined
+    },
+    contactInfo: {
+      email: "investor@example.com",
+      phoneNumber: "9876543210",
+    },
+    documentInfo: {
+      panCardDocumentS3Key: "kyc/pan/kyc-abc123/pan-card.pdf",
+      aadhaarCardDocumentS3Key: "kyc/aadhaar/kyc-abc123/address-proof.pdf",  // Alt doc or copy of PAN key
+      isAadhaarAddressCurrent: true,   // true = PAN address matches
+      addressProofDocumentType: "UTILITY_BILL",  // Only set when address doesn't match
+      addressProofDocumentS3Key: "",
+    },
+    // declarations is undefined for single-page submissions
+  }
+}
+```
+
+### Legacy vs Simplified Record Detection
+
+```typescript
+// Heuristic: legacy records have dateOfBirth, gender, or aadhaarNumber populated
+function isLegacyKycRecord(kycData: KycData): boolean {
+  const pi = kycData?.personalInfo;
+  return !!(pi?.dateOfBirth || pi?.gender || pi?.aadhaarNumber);
+}
+```
+
+### Frontend Form State → API Payload Mapping
+
+| Form Field | API Payload Field | Backend Target |
+|------------|-------------------|----------------|
+| `phoneNumber` | `phoneNumber` | `KycContactInfo.phoneNumber` |
+| `email` | `email` | `KycContactInfo.email` |
+| `firstName` | `firstName` | Used to construct `KycPersonalInfo.fullName` |
+| `middleName` | `middleName` | Used to construct `KycPersonalInfo.fullName` |
+| `lastName` | `lastName` | Used to construct `KycPersonalInfo.fullName` |
+| `panNumber` | `panNumber` | `KycPersonalInfo.panNumber` |
+| `state` | `state` | `AddressInfo.state` |
+| `panCardS3Key` | `panCardDocumentS3Key` | `KycDocumentInfo.panCardDocumentS3Key` |
+| `addressMatchesPan` | `addressMatchesPan` | `KycDocumentInfo.isAadhaarAddressCurrent` |
+| `altAddressProofType` | `altAddressProofDocumentType` | `KycDocumentInfo.addressProofDocumentType` |
+| `altAddressProofS3Key` | `altAddressProofDocumentS3Key` | `KycDocumentInfo.aadhaarCardDocumentS3Key` |
+
+### Notification Params (Simplified)
+
+```typescript
+// buildKycSubmissionNotificationParams output for single-page submissions
+{
+  // Order info
+  orderId: string,
+  orderSubmissionDateTime: string,
+  orderLinkForRa: string,
+  orderLinkForClient: string,
+
+  // Contact
+  clientPhone: string,
+  clientEmail: string,
+  notifyClientByEMAIL: boolean,
+  notifyClientBySMS: boolean,
+  raWhatsAppNumber: string,
+  raEmail: string,
+  raName: string,
+  planName: string,
+
+  // Personal (simplified)
+  clientName: string,
+  fullName: string,
+  panNo: string,
+  state: string,          // NEW
+
+  // Documents
+  panFileBucket: string,
+  panFileKey: string,
+  panFileType: string,
+  aadharFileBucket: string,
+  aadharFileKey: string,
+  aadharFileType: string,
+  invoiceFileBucket: string,
+  invoiceFileKey: string,
+  invoiceFileType: string,
+
+  // REMOVED: fatherName, dateOfBirth, gender, maritalStatus, nationality,
+  //          residentialStatus, occupation, annualIncome, pep, aadhar, currentAddress
+}
+```
+
