@@ -2,247 +2,198 @@
 
 ## Introduction
 
-Redesign the existing 5-step multi-page KYC (Know Your Customer) flow into a single-page form. The current flow collects personal details, address details, contact details, document uploads, and declarations across separate steps. The new design consolidates all required fields onto one page with a simplified field set: Phone, Email, First Name, Middle Name, Last Name, PAN Number, State, ID Proof (PAN card), and Address Proof (with conditional alternative document upload). Phone and email verification behavior is preserved from the current flow. The backend KYC service, DynamoDB model, and S3 document storage are updated to support the new simplified data structure while maintaining backward compatibility with existing KYC records.
+KYC V2 Simplified Form is a new, standalone KYC flow that runs alongside the existing KYC v1 process. It collects a reduced set of fields — PAN Number, Father's/Spouse's Name, Communication Address (free-text or structured), ID Proof document, and Address Proof document — through a single-step form submission. The v2 flow lives in its own model, service, and controller files (`kycv2.model.ts`, `kyc-v2-service.ts`, `update-kyc-v2-controller.ts`) and reuses shared types from the existing `kyc.model.ts`. The existing KYC v1 code remains completely untouched.
 
 ## Glossary
 
-- **KYC_Form**: The single-page frontend React component that collects all KYC information from the investor
-- **KYC_Service**: The backend Lambda service (`kyc-service.ts`) that processes KYC start, update, and submission requests
-- **KYC_Metadata**: The DynamoDB record storing KYC status, sub-status, and collected data for a given KYC session
-- **Investor**: A retail user subscribing to an analyst's plan who must complete KYC before subscription activation
-- **PAN_Card**: Permanent Account Number card issued by the Indian Income Tax Department, used as both identity proof and primary address proof
-- **Address_Proof_Document**: An alternative document uploaded when the PAN card address does not match the investor's current address; one of: utility bill (≤ 2 months old), property tax receipt, pension payment order, or employer accommodation letter
-- **Aadhaar_Bucket**: The existing S3 bucket mapped to `KYC_AADHAR_CARD` presigned URL type (`ipier-kyc-documents`), reused for storing alternative address proof documents
-- **OTP_Verification**: One-time password verification sent via SMS or email to confirm the investor's contact information
-- **Contact_Method**: The channel (`mobile` or `email`) used for OTP delivery during KYC initiation
-- **KYC_Update_Controller**: The backend Lambda handler (`update-kyc-controller.ts`) that routes KYC update events to the appropriate KYC_Service method
-- **Presigned_URL_Service**: The backend service that generates S3 presigned URLs for secure document upload and download
-- **KYC_Notification_Service**: The backend TypeScript service (`kyc-notification-service.ts`) that builds notification parameters and sends KYC-related notifications (submission, approval, rejection, eSignature completion) to SQS for downstream processing
-- **Notification_Params_Builder**: The set of methods within KYC_Notification_Service (`buildKycSubmissionNotificationParams`, `buildEsignCompletedNotificationParams`) that construct the key-value parameter maps sent to the Java notification Lambda
-- **SES_Email_Template**: An AWS SES email template (e.g., `RaMailOnKycSubmissionTemplate`, `RaMailOnESignCompleteTemplate`, `ClientKycSubmittedEmailTemplate`) rendered by the Java notification Lambda (`SesEmailSender.java`) with placeholder substitution from notification parameters
-- **WhatsApp_Body_Builder**: Java classes (`KycSubmissionWhatsAppBodyBuilder`, `ESignCompleteWhatsAppBodyBuilder`) that construct WhatsApp message payloads from notification parameters for RA notifications
-- **KYC_Details_Page**: The frontend React component (`KYCDetails.js`) that displays submitted KYC data to the research analyst for verification and approval/rejection
-- **KYC_Data_Transformer**: The frontend function (`transformApiDataToDisplayFormat`) that maps raw KYC_Metadata API responses into the display format consumed by the KYC_Details_Page
-- **Simplified_Field_Set**: The reduced set of KYC data fields collected by the redesigned single-page form: phone number, email, full name (first, middle, last), PAN number, state, PAN card document, and address proof document
+- **KycV2Controller**: The AWS Lambda handler that receives KYC V2 API requests, parses the request body, validates required fields, and delegates to the KycV2Service.
+- **KycV2Service**: The business logic service that validates v2 form data, persists KYC metadata, generates invoices, sends notifications, and updates order and subscription statuses.
+- **KycV2Model**: The TypeScript module (`kycv2.model.ts`) defining v2-specific interfaces and types while importing shared enums and interfaces from the existing `kyc.model.ts`.
+- **KycMetadataDao**: The existing DynamoDB data access object used to read and write KYC metadata records.
+- **KycNotificationService**: The existing service that dispatches KYC-related email and SMS notifications via SQS.
+- **PAN_Number**: A ten-character alphanumeric Permanent Account Number issued by the Indian Income Tax Department, matching the pattern `[A-Z]{5}[0-9]{4}[A-Z]{1}`.
+- **AddressInfo**: The existing interface representing a postal address, supporting `SINGLE_TEXT` (free-form `addressText`) and `ITEMIZED_TEXT` (structured fields: `addressLine1`, `addressLine2`, `city`, `state`, `postalCode`, `country`) formats. Both formats are accepted by the V2 form.
+- **AddressProofDocumentType**: The existing enum listing accepted address proof document types (PASSPORT, VOTER_ID, DRIVING_LICENSE, UTILITY_BILL, BANK_STATEMENT, RENT_AGREEMENT).
+- **IdProofDocumentType**: A new enum listing accepted ID proof document types for the v2 form (e.g., PAN_CARD, PASSPORT, VOTER_ID, DRIVING_LICENSE).
+- **KycStatus**: The existing enum representing the lifecycle status of a KYC record (NOT_STARTED, IN_PROGRESS, IN_REVIEW, COMPLETED, REJECTED, EXPIRED).
+- **KycV2PersonalInfo**: A new v2-specific interface containing only `panNumber` and `fatherOrSpouseName`.
+- **KycV2DocumentInfo**: A new v2-specific interface containing `idProofDocumentType`, `idProofDocumentS3Key`, `addressProofDocumentType`, and `addressProofDocumentS3Key`.
+- **KycV2Data**: A new v2-specific interface aggregating `KycV2PersonalInfo`, `communicationAddress` (AddressInfo), and `KycV2DocumentInfo`.
+- **KycV2UpdateRequest**: A new v2-specific request interface for the single-step form submission containing all v2 fields plus `kycId`.
+- **KycV2EventType**: A new enum for v2-specific event types (e.g., KYC_V2_FORM_SUBMITTED, KYC_V2_RA_VERIFICATION_COMPLETED, KYC_V2_RA_VERIFICATION_FAILED).
 
 ## Requirements
 
-### Requirement 1: Single-Page Form Layout
+### Requirement 1: KYC V2 Model Definition
 
-**User Story:** As an investor, I want to complete all KYC fields on a single page, so that I can finish KYC faster without navigating through multiple steps.
-
-#### Acceptance Criteria
-
-1. THE KYC_Form SHALL render all KYC input fields (Phone, Email, First Name, Middle Name, Last Name, PAN Number, State, ID Proof upload, Address Proof section) on a single page without step navigation
-2. THE KYC_Form SHALL remove the step indicator, step navigation buttons (Next/Previous), and multi-step progress bar from the current implementation
-3. THE KYC_Form SHALL display a single "Submit KYC" button at the bottom of the form that submits all collected data in one request
-4. WHEN the KYC_Form is loaded with existing KYC_Metadata (resume scenario), THE KYC_Form SHALL pre-populate all fields with previously saved data
-
-### Requirement 2: Phone Number Field
-
-**User Story:** As an investor, I want to provide my phone number during KYC, so that my identity can be verified via OTP.
+**User Story:** As a developer, I want a dedicated v2 model file that defines simplified KYC interfaces and types, so that the v2 form has its own type-safe data structures without modifying the existing v1 model.
 
 #### Acceptance Criteria
 
-1. THE KYC_Form SHALL display a phone number input field that accepts a 10-digit Indian mobile number starting with digits 6-9
-2. WHEN the KYC_Form is loaded with an initial phone number from the subscription context or Cognito session cache, THE KYC_Form SHALL pre-populate the phone number field with that value
-3. WHEN the investor enters a phone number that does not match the pattern `^[6-9]\d{9}$`, THE KYC_Form SHALL display the validation error "Mobile number must be 10 digits starting with 6-9"
-4. THE KYC_Form SHALL preserve the existing OTP verification behavior for phone numbers as implemented in the current KYC flow (OTP sent via SMS when contact method is `mobile`)
+1. THE KycV2Model SHALL define a `KycV2PersonalInfo` interface containing exactly two fields: `panNumber` (string) and `fatherOrSpouseName` (string).
+2. THE KycV2Model SHALL define an `IdProofDocumentType` enum containing at minimum the values PAN_CARD, PASSPORT, VOTER_ID, and DRIVING_LICENSE.
+3. THE KycV2Model SHALL define a `KycV2DocumentInfo` interface containing `idProofDocumentType` (IdProofDocumentType), `idProofDocumentS3Key` (string), `addressProofDocumentType` (AddressProofDocumentType), and `addressProofDocumentS3Key` (string).
+4. THE KycV2Model SHALL define a `KycV2Data` interface containing `kycId` (string), `personalInfo` (KycV2PersonalInfo, optional), `communicationAddress` (AddressInfo, optional), and `documentInfo` (KycV2DocumentInfo, optional).
+5. THE KycV2Model SHALL import and reuse `KycStatus`, `KycSubStatus`, `AddressInfo`, `AddressFormat`, `AddressProofDocumentType`, `KycMetadata`, and `KycEvent` from the existing `kyc.model.ts`.
+6. THE KycV2Model SHALL define a `KycV2EventType` enum containing at minimum KYC_V2_FORM_SUBMITTED, KYC_V2_RA_VERIFICATION_COMPLETED, and KYC_V2_RA_VERIFICATION_FAILED.
+7. THE KycV2Model SHALL define a `KycV2UpdateRequest` interface containing `eventType` (KycV2EventType), `kycId` (string), `personalInfo` (KycV2PersonalInfo, optional), `communicationAddress` (AddressInfo, optional), `documentInfo` (KycV2DocumentInfo, optional), `kycRejectionReason` (string, optional), and `authHeader` (string, optional).
 
-### Requirement 3: Email Field
+### Requirement 2: KYC V2 Controller / Lambda Handler
 
-**User Story:** As an investor, I want to provide my email address during KYC, so that I can receive KYC-related communications.
-
-#### Acceptance Criteria
-
-1. THE KYC_Form SHALL display an email input field
-2. WHEN the KYC_Form is loaded with an initial email from the subscription context or Cognito session cache, THE KYC_Form SHALL pre-populate the email field with that value
-3. WHEN the investor enters an email that does not match the pattern `^[^\s@]+@[^\s@]+\.[^\s@]+$`, THE KYC_Form SHALL display the validation error "Please enter a valid email address"
-4. THE KYC_Form SHALL preserve the existing OTP verification behavior for email as implemented in the current KYC flow (OTP sent via email when contact method is `email`)
-
-### Requirement 4: Name Fields
-
-**User Story:** As an investor, I want to provide my full name (first, middle, last) during KYC, so that my identity can be verified against my PAN card.
+**User Story:** As a developer, I want a dedicated v2 Lambda handler that processes KYC V2 update requests, so that v2 API traffic is routed independently from the existing v1 handler.
 
 #### Acceptance Criteria
 
-1. THE KYC_Form SHALL display three separate text input fields: First Name (required), Middle Name (optional), and Last Name (required)
-2. WHEN the investor submits the form with an empty First Name or Last Name field, THE KYC_Form SHALL display a validation error indicating the field is required
-3. THE KYC_Form SHALL accept only letters and spaces in the First Name, Middle Name, and Last Name fields, matching the pattern `^[A-Za-z\s]+$`
-4. WHEN the KYC_Form is loaded with an initial first name or last name from the Cognito session cache, THE KYC_Form SHALL pre-populate the respective name fields with those values
-5. THE KYC_Service SHALL store the three name fields and construct a `fullName` by concatenating First Name, Middle Name (if provided), and Last Name separated by spaces for backward compatibility with the existing `KycPersonalInfo.fullName` field
+1. THE KycV2Controller SHALL parse the API Gateway request body as a `KycV2UpdateRequest`.
+2. WHEN the request body is missing, THE KycV2Controller SHALL return HTTP status 400 with a JSON body containing a descriptive error message.
+3. WHEN the `eventType` field is missing from the parsed request, THE KycV2Controller SHALL return HTTP status 400 with a JSON body containing a descriptive error message.
+4. WHEN the `kycId` field is missing from the parsed request, THE KycV2Controller SHALL return HTTP status 400 with a JSON body containing a descriptive error message.
+5. WHEN the `eventType` is `KYC_V2_FORM_SUBMITTED`, THE KycV2Controller SHALL delegate to the KycV2Service `submitV2Form` method.
+6. WHEN the `eventType` is `KYC_V2_RA_VERIFICATION_COMPLETED`, THE KycV2Controller SHALL delegate to the KycV2Service `approveKycV2` method.
+7. WHEN the `eventType` is `KYC_V2_RA_VERIFICATION_FAILED`, THE KycV2Controller SHALL delegate to the KycV2Service `rejectKycV2` method.
+8. WHEN the `eventType` does not match any recognized KycV2EventType value, THE KycV2Controller SHALL return HTTP status 400 with a JSON body containing the message "Invalid kyc v2 event".
+9. THE KycV2Controller SHALL include CORS headers (`Access-Control-Allow-Origin: *`) in every response.
+10. IF an unhandled exception occurs during request processing, THEN THE KycV2Controller SHALL return HTTP status 500 with a JSON body containing the error message.
+11. WHEN an `Authorization` header is present in the API Gateway event, THE KycV2Controller SHALL forward the authorization value to the KycV2UpdateRequest `authHeader` field.
 
-### Requirement 5: PAN Number Field
+### Requirement 3: KYC V2 PAN Number Validation
 
-**User Story:** As an investor, I want to provide my PAN number during KYC, so that my identity can be verified as required by SEBI regulations.
-
-#### Acceptance Criteria
-
-1. THE KYC_Form SHALL display a PAN number text input field
-2. WHEN the investor enters a PAN number that does not match the pattern `^[A-Z]{5}[0-9]{4}[A-Z]{1}$`, THE KYC_Form SHALL display the validation error "PAN must be in format: ABCDE1234F"
-3. THE KYC_Form SHALL automatically convert lowercase PAN input to uppercase before validation
-4. WHEN the investor submits the form with an empty PAN number field, THE KYC_Form SHALL display a validation error indicating PAN number is required
-
-### Requirement 6: State Field
-
-**User Story:** As an investor, I want to select my state during KYC, so that my address jurisdiction is recorded for regulatory compliance.
+**User Story:** As a compliance officer, I want PAN numbers validated against the standard Indian PAN format, so that only structurally valid PAN numbers are accepted in the v2 form.
 
 #### Acceptance Criteria
 
-1. THE KYC_Form SHALL display a dropdown select field for State populated with all Indian states and union territories from the existing `INDIAN_STATES` configuration
-2. WHEN the investor submits the form without selecting a state, THE KYC_Form SHALL display a validation error indicating state selection is required
-3. THE KYC_Service SHALL store the selected state value in the KYC_Metadata address information
+1. WHEN a `KycV2UpdateRequest` with `eventType` KYC_V2_FORM_SUBMITTED is received, THE KycV2Service SHALL validate that `personalInfo.panNumber` is present and non-empty.
+2. WHEN the `panNumber` value does not match the regex pattern `^[A-Z]{5}[0-9]{4}[A-Z]{1}$`, THE KycV2Service SHALL return a validation error indicating the PAN number format is invalid.
+3. WHEN the `panNumber` value contains lowercase letters, THE KycV2Service SHALL return a validation error indicating the PAN number format is invalid.
 
-### Requirement 7: ID Proof Upload (PAN Card)
+### Requirement 4: KYC V2 Father's / Spouse's Name Validation
 
-**User Story:** As an investor, I want to upload my PAN card as identity proof during KYC, so that my identity can be verified by the research analyst.
-
-#### Acceptance Criteria
-
-1. THE KYC_Form SHALL display a file upload field labeled "ID Proof (PAN Card)" that accepts JPEG, PNG, and PDF files up to 10MB
-2. WHEN the investor selects a file that exceeds 10MB or has an unsupported file type, THE KYC_Form SHALL display an appropriate validation error
-3. WHEN the investor uploads a PAN card file, THE KYC_Form SHALL upload the file to S3 using the `KYC_PAN_CARD` presigned URL type via the existing Presigned_URL_Service
-4. THE KYC_Form SHALL display a preview or filename indicator after successful upload
-5. WHEN the investor submits the form without uploading a PAN card file, THE KYC_Form SHALL display a validation error indicating ID proof upload is required
-
-### Requirement 8: Address Proof Logic
-
-**User Story:** As an investor, I want to use my PAN card as address proof when my address matches, or upload an alternative document when it does not, so that I can satisfy the address verification requirement.
+**User Story:** As a compliance officer, I want the father's or spouse's name to be a required field, so that the KYC record contains the mandatory family reference as per regulatory requirements.
 
 #### Acceptance Criteria
 
-1. THE KYC_Form SHALL display a checkbox or toggle labeled "My PAN card address matches my current address" (default: checked)
-2. WHILE the address match checkbox is checked, THE KYC_Form SHALL use the uploaded PAN card as address proof and hide the alternative document upload section
-3. WHEN the investor unchecks the address match checkbox, THE KYC_Form SHALL display an alternative address proof upload section with a document type selector
-4. THE KYC_Form SHALL offer the following alternative address proof document types: Utility Bill (≤ 2 months old), Property Tax Receipt, Pension Payment Order, Employer Accommodation Letter
-5. WHEN the investor selects "Utility Bill" as the alternative document type, THE KYC_Form SHALL display a note indicating the utility bill must be dated within the last 2 months
-6. WHEN the investor unchecks the address match checkbox and submits the form without uploading an alternative address proof document, THE KYC_Form SHALL display a validation error indicating an alternative address proof is required
-7. WHEN the investor uploads an alternative address proof document, THE KYC_Form SHALL upload the file to S3 using the `KYC_AADHAR_CARD` presigned URL type (Aadhaar_Bucket) via the existing Presigned_URL_Service
+1. WHEN a `KycV2UpdateRequest` with `eventType` KYC_V2_FORM_SUBMITTED is received, THE KycV2Service SHALL validate that `personalInfo.fatherOrSpouseName` is present and non-empty after trimming whitespace.
+2. WHEN the `fatherOrSpouseName` field is missing or empty after trimming, THE KycV2Service SHALL return a validation error listing `fatherOrSpouseName` as a mandatory missing field.
 
-### Requirement 9: Backend KYC Data Model Update
+### Requirement 5: KYC V2 Communication Address Validation
 
-**User Story:** As a developer, I want the KYC data model to support the new simplified field set, so that the single-page form data can be stored and retrieved correctly.
+**User Story:** As a compliance officer, I want the communication address to use the existing AddressInfo interface supporting both SINGLE_TEXT and ITEMIZED_TEXT formats, so that the address can be submitted as either free-form text or structured fields depending on the client's preference.
 
 #### Acceptance Criteria
 
-1. THE KYC_Service SHALL accept a new update event type for single-page form submission that includes all fields (phone, email, first name, middle name, last name, PAN number, state, PAN card S3 key, address proof match flag, alternative address proof document type, alternative address proof S3 key)
-2. THE KYC_Service SHALL validate all required fields (phone, email, first name, last name, PAN number, state, PAN card S3 key) are present before persisting the KYC data
-3. IF a required field is missing from the submission, THEN THE KYC_Service SHALL return a 400 response with a descriptive error message identifying the missing field
-4. THE KYC_Service SHALL construct the `fullName` field by concatenating first name, middle name (if provided), and last name for backward compatibility with existing KYC_Metadata consumers
-5. THE KYC_Service SHALL store the alternative address proof document S3 key in the `aadhaarCardDocumentS3Key` field of `KycDocumentInfo` to reuse the existing Aadhaar_Bucket storage path
-6. THE KYC_Service SHALL set the `panCardDocumentS3Key` field in `KycDocumentInfo` with the uploaded PAN card S3 key
-7. WHEN the address match flag is true, THE KYC_Service SHALL set `isAadhaarAddressCurrent` to true and copy the PAN card S3 key as the address proof document S3 key
+1. WHEN a `KycV2UpdateRequest` with `eventType` KYC_V2_FORM_SUBMITTED is received, THE KycV2Service SHALL validate that `communicationAddress` is present.
+2. THE KycV2Service SHALL validate that `communicationAddress.addressFormat` equals either `AddressFormat.SINGLE_TEXT` or `AddressFormat.ITEMIZED_TEXT`.
+3. WHEN `communicationAddress.addressFormat` is `SINGLE_TEXT`, THE KycV2Service SHALL validate that `communicationAddress.addressText` is present and non-empty after trimming whitespace.
+4. WHEN `communicationAddress.addressFormat` is `ITEMIZED_TEXT`, THE KycV2Service SHALL validate that `communicationAddress.addressLine1` is present and non-empty after trimming whitespace.
+5. WHEN `communicationAddress.addressFormat` is `ITEMIZED_TEXT`, THE KycV2Service SHALL validate that `communicationAddress.city` is present and non-empty after trimming whitespace.
+6. WHEN `communicationAddress.addressFormat` is `ITEMIZED_TEXT`, THE KycV2Service SHALL validate that `communicationAddress.state` is present and non-empty after trimming whitespace.
+7. WHEN `communicationAddress.addressFormat` is `ITEMIZED_TEXT`, THE KycV2Service SHALL validate that `communicationAddress.postalCode` is present and non-empty after trimming whitespace.
+8. WHEN `communicationAddress.country` is missing or empty, THE KycV2Service SHALL return a validation error listing `country` as a mandatory missing field (applies to both formats).
+9. WHEN any required address field is missing or empty, THE KycV2Service SHALL return a validation error listing all missing fields.
 
-### Requirement 10: Backend Backward Compatibility
+### Requirement 6: KYC V2 Document Upload Validation
 
-**User Story:** As a developer, I want existing KYC records and the RA verification dashboard to continue working after the redesign, so that in-progress and completed KYC records are not affected.
-
-#### Acceptance Criteria
-
-1. THE KYC_Service SHALL continue to support all existing `KycEventType` values for in-progress KYC records that were started before the redesign
-2. THE KYC_Update_Controller SHALL route the new single-page submission event type to the appropriate KYC_Service method without affecting existing event type routing
-3. THE KYC_Service SHALL populate the existing `KycPersonalInfo`, `AddressInfo`, `KycContactInfo`, and `KycDocumentInfo` structures in KYC_Metadata from the new simplified field set so that the RA verification dashboard (KYCDashboard) can display the data without modification
-4. THE KYC_Service SHALL preserve the existing KYC status flow (IN_PROGRESS → IN_REVIEW → COMPLETED/REJECTED) and sub-status transitions for the new single-page submission path
-
-### Requirement 11: Form Submission and Status Transition
-
-**User Story:** As an investor, I want my KYC form submission to trigger the correct status transitions, so that the research analyst is notified to review my KYC.
+**User Story:** As a compliance officer, I want both ID proof and address proof documents to be required with their respective types, so that the KYC record has the necessary supporting documents for verification.
 
 #### Acceptance Criteria
 
-1. WHEN the investor submits the single-page KYC form successfully, THE KYC_Service SHALL transition the KYC status to `IN_REVIEW` and sub-status to `KYC_FORM_SUBMITTED`
-2. WHEN the KYC form submission succeeds, THE KYC_Form SHALL navigate the investor to the subscription status page (if in subscription flow) or display a success message (if in standalone/short-URL flow)
-3. IF the KYC form submission fails due to a server error, THEN THE KYC_Form SHALL display an error message and allow the investor to retry submission without losing entered data
-4. THE KYC_Service SHALL create an audit event of type `KYC_FORM_SUBMITTED` with the full submission data for regulatory compliance logging
+1. WHEN a `KycV2UpdateRequest` with `eventType` KYC_V2_FORM_SUBMITTED is received, THE KycV2Service SHALL validate that `documentInfo` is present.
+2. THE KycV2Service SHALL validate that `documentInfo.idProofDocumentType` is a valid value from the `IdProofDocumentType` enum.
+3. THE KycV2Service SHALL validate that `documentInfo.idProofDocumentS3Key` is present and non-empty.
+4. THE KycV2Service SHALL validate that `documentInfo.addressProofDocumentType` is a valid value from the `AddressProofDocumentType` enum.
+5. THE KycV2Service SHALL validate that `documentInfo.addressProofDocumentS3Key` is present and non-empty.
+6. WHEN any document field is missing or invalid, THE KycV2Service SHALL return a validation error listing all missing or invalid document fields.
 
-### Requirement 12: Form Validation Summary
+### Requirement 7: KYC V2 Form Submission Processing
 
-**User Story:** As an investor, I want to see all validation errors at once when I submit the form, so that I can correct all issues before resubmitting.
-
-#### Acceptance Criteria
-
-1. WHEN the investor clicks "Submit KYC" with one or more invalid or missing required fields, THE KYC_Form SHALL display all validation errors simultaneously next to their respective fields
-2. WHEN the investor clicks "Submit KYC" with validation errors, THE KYC_Form SHALL scroll to the first field with an error
-3. WHEN the investor corrects a field that previously had a validation error, THE KYC_Form SHALL clear that specific error in real time without requiring resubmission
-
-### Requirement 13: KYC Submission Notification Params Simplification
-
-**User Story:** As a developer, I want the KYC submission notification parameters builder to only include the simplified field set, so that downstream email and WhatsApp templates do not reference fields that the new form no longer collects.
+**User Story:** As a user, I want to submit the simplified KYC form in a single step, so that my KYC verification can begin without navigating through multiple form pages.
 
 #### Acceptance Criteria
 
-1. THE KYC_Notification_Service `buildKycSubmissionNotificationParams` method SHALL include the following fields in the notification parameters: orderId, orderSubmissionDateTime, orderLinkForRa, orderLinkForClient, clientPhone, clientEmail, notifyClientByEMAIL, notifyClientBySMS, raWhatsAppNumber, raEmail, raName, planName, clientName, fullName, panNo, panFileBucket, panFileKey, panFileType, aadharFileBucket, aadharFileKey, aadharFileType, invoiceFileBucket, invoiceFileKey, invoiceFileType, and state
-2. THE KYC_Notification_Service `buildKycSubmissionNotificationParams` method SHALL stop sending the following removed fields: fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, pep, aadhar (full Aadhaar number), and currentAddress (formatted multi-line address)
-3. THE KYC_Notification_Service `buildEsignCompletedNotificationParams` method SHALL include the same Simplified_Field_Set parameters as the submission notification (fullName, panNo, state, clientPhone, planName, raName, raEmail, raWhatsAppNumber) and document attachment references (PAN card, address proof, signed agreement, invoice)
-4. THE KYC_Notification_Service `buildEsignCompletedNotificationParams` method SHALL stop sending the following removed fields: fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, pep, aadhar (full Aadhaar number), and currentAddress
+1. WHEN a valid `KycV2UpdateRequest` with `eventType` KYC_V2_FORM_SUBMITTED is received, THE KycV2Service SHALL retrieve the existing KycMetadata record using the provided `kycId`.
+2. IF no KycMetadata record exists for the provided `kycId`, THEN THE KycV2Service SHALL return an error response with the message "KYC not found".
+3. WHEN the KycMetadata record is in a state that does not permit updates, THE KycV2Service SHALL return an error response indicating the KYC is not in a valid state for submission.
+4. WHEN all validations pass, THE KycV2Service SHALL map the v2 personal info fields (`panNumber`, `fatherOrSpouseName`) into the `KycData.personalInfo` structure on the KycMetadata record, leaving fields not collected by v2 as undefined.
+5. WHEN all validations pass, THE KycV2Service SHALL store the `communicationAddress` with `addressFormat: SINGLE_TEXT` and the user-provided `addressText` into the `KycData.communicationAddress` field on the KycMetadata record.
+6. WHEN all validations pass, THE KycV2Service SHALL map the v2 document info into the `KycData.documentInfo` structure on the KycMetadata record, storing `idProofDocumentS3Key` as `panCardDocumentS3Key` and the address proof fields in their corresponding fields.
+7. WHEN all validations pass, THE KycV2Service SHALL update the KycMetadata `status` to `IN_REVIEW` and `subStatus` to `KYC_RA_VERIFICATION_PENDING`.
+8. WHEN all validations pass, THE KycV2Service SHALL update the KycMetadata `lastEventType` to `KYC_V2_FORM_SUBMITTED` and `lastUpdatedTime` to the current timestamp.
+9. WHEN all validations pass, THE KycV2Service SHALL persist the updated KycMetadata record to DynamoDB via the KycMetadataDao.
+10. WHEN all validations pass, THE KycV2Service SHALL create a KYC audit event recording the form submission.
+11. WHEN all validations pass, THE KycV2Service SHALL return a success response containing the `kycId`, updated `status`, updated `subStatus`, and the `kycMetadata`.
 
-### Requirement 14: RA Email Template Update for KYC Submission
+### Requirement 8: KYC V2 Invoice Generation
 
-**User Story:** As a research analyst, I want the KYC submission email to show only the simplified investor details, so that the email content matches the data actually collected from the investor.
-
-#### Acceptance Criteria
-
-1. THE SES_Email_Template `RaMailOnKycSubmissionTemplate` SHALL display the following investor fields: full name, PAN number, phone number, email, and state
-2. THE SES_Email_Template `RaMailOnKycSubmissionTemplate` SHALL remove display of the following fields: father/spouse name, date of birth, gender, marital status, nationality, residential status, occupation, annual income, net worth, PEP status, Aadhaar number (last 4 digits), correspondence address, and permanent address
-3. THE SES_Email_Template `RaMailOnKycSubmissionTemplate` SHALL continue to attach the PAN card document, address proof document, and invoice as PDF attachments
-4. THE Java `SesEmailSender.sendRaKycSubmitted` method SHALL stop populating removed template placeholders (fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, netWorth, pep, aadharLast4, currentAddress, permanentAddress) from the notification parameters
-
-### Requirement 15: RA Email Template Update for eSignature Completion
-
-**User Story:** As a research analyst, I want the eSignature completion email to reflect the simplified KYC data, so that the email is consistent with the new KYC form.
+**User Story:** As a business stakeholder, I want an invoice generated upon v2 form submission, so that the financial record is created consistently with the v1 flow.
 
 #### Acceptance Criteria
 
-1. THE SES_Email_Template `RaMailOnESignCompleteTemplate` SHALL display the following investor fields: full name, PAN number, phone number, email, and state
-2. THE SES_Email_Template `RaMailOnESignCompleteTemplate` SHALL remove display of the following fields: father/spouse name, date of birth, gender, marital status, nationality, residential status, occupation, annual income, PEP status, Aadhaar number, and full address
-3. THE SES_Email_Template `RaMailOnESignCompleteTemplate` SHALL continue to attach the PAN card document, address proof document, signed agreement document, and invoice as PDF attachments
+1. WHEN a v2 form submission passes all validations, THE KycV2Service SHALL retrieve the analyst info, subscription plan, and order details associated with the KycMetadata record.
+2. IF the analyst info cannot be found, THEN THE KycV2Service SHALL throw an error with the message "Analyst not found".
+3. WHEN analyst info, subscription plan, and order details are available, THE KycV2Service SHALL generate an invoice PDF and store the S3 key.
+4. WHEN the invoice is generated, THE KycV2Service SHALL update the order status to KYC_SUBMITTED with the invoice S3 key.
 
-### Requirement 16: Client KYC Submission Email Template Update
+### Requirement 9: KYC V2 Notification Dispatch
 
-**User Story:** As an investor, I want the KYC submission confirmation email I receive to reflect only the information I actually provided, so that the email content is accurate and not confusing.
-
-#### Acceptance Criteria
-
-1. THE SES_Email_Template `ClientKycSubmittedEmailTemplate` SHALL reference only the Simplified_Field_Set (full name, order ID, order link) in the email body
-2. THE SES_Email_Template `ClientKycSubmittedEmailTemplate` SHALL not reference any removed fields (father/spouse name, date of birth, gender, marital status, Aadhaar number, occupation, annual income, full address)
-
-### Requirement 17: WhatsApp Notification Template Compatibility
-
-**User Story:** As a developer, I want the WhatsApp notification templates to remain functional with the simplified notification parameters, so that RA WhatsApp alerts continue to work after the redesign.
+**User Story:** As a user, I want to receive a notification when my v2 KYC form is submitted, so that I have confirmation that my KYC is under review.
 
 #### Acceptance Criteria
 
-1. THE WhatsApp_Body_Builder `KycSubmissionWhatsAppBodyBuilder` SHALL continue to use the fields planName, orderId, fullName, and clientPhone which remain available in the simplified notification parameters
-2. THE WhatsApp_Body_Builder `ESignCompleteWhatsAppBodyBuilder` SHALL continue to use the fields orderId, fullName, clientPhone, and planName which remain available in the simplified notification parameters
-3. WHEN a notification parameter referenced by a WhatsApp_Body_Builder is absent or null, THE WhatsApp_Body_Builder SHALL substitute a default placeholder value to prevent message rendering failures
+1. WHEN a v2 form submission passes all validations and the invoice is generated, THE KycV2Service SHALL invoke the KycNotificationService `sendKycSubmittedNotification` method with the KycMetadata, analyst info, subscription plan, and invoice S3 key.
+2. IF the notification dispatch fails, THEN THE KycV2Service SHALL log the error and continue processing without failing the overall submission.
 
-### Requirement 18: KYC Details Page Simplification for New Records
+### Requirement 10: KYC V2 User Subscription Status Update
 
-**User Story:** As a research analyst, I want the KYC details verification page to display only the simplified fields for new KYC submissions, so that I can review the data the investor actually provided without seeing empty or irrelevant fields.
-
-#### Acceptance Criteria
-
-1. WHEN the KYC_Details_Page displays a KYC record submitted via the new single-page form, THE KYC_Details_Page SHALL show the following fields in the Personal Information section: full name, PAN number, phone number (with verification badge), and email (with verification badge)
-2. WHEN the KYC_Details_Page displays a KYC record submitted via the new single-page form, THE KYC_Details_Page SHALL hide the following fields from the Personal Information section: father/spouse name, date of birth, gender, marital status, nationality, residential status, Aadhaar number, occupation, annual income, net worth, and PEP status
-3. WHEN the KYC_Details_Page displays a KYC record submitted via the new single-page form, THE KYC_Details_Page SHALL show the state value in the Address Information section instead of the full correspondence and permanent address breakdown (address line 1, address line 2, city, district, country, PIN code)
-4. THE KYC_Details_Page SHALL continue to display the Documents section with PAN card and address proof document view buttons, and the invoice download button
-5. THE KYC_Data_Transformer SHALL map the state field from `KYC_Metadata.kycData.communicationAddress.state` for display on the KYC_Details_Page
-
-### Requirement 19: KYC Details Page Backward Compatibility for Legacy Records
-
-**User Story:** As a research analyst, I want to continue viewing full KYC details for records submitted before the redesign, so that I can still review and verify older KYC submissions with all their original data.
+**User Story:** As a system administrator, I want the user subscription status updated to KYC_SUBMITTED upon v2 form submission, so that the subscription lifecycle reflects the KYC progress.
 
 #### Acceptance Criteria
 
-1. WHEN the KYC_Details_Page displays a KYC record submitted via the legacy multi-step form (containing populated fields such as dateOfBirth, gender, maritalStatus, or aadhaarNumber in personalInfo), THE KYC_Details_Page SHALL render all legacy fields (father/spouse name, date of birth, gender, marital status, nationality, residential status, Aadhaar number, occupation, annual income, net worth, PEP status, full correspondence address, permanent address)
-2. THE KYC_Data_Transformer SHALL detect whether a KYC record is a legacy or simplified submission by checking for the presence of legacy-only fields (dateOfBirth, gender, or aadhaarNumber) in the personalInfo object
-3. THE KYC_Details_Page SHALL use the legacy/simplified detection result to conditionally render the appropriate field layout without requiring changes to the backend GetKycController API response
+1. WHEN a v2 form submission completes and the KycMetadata contains a `userId`, `subscriptionId`, and `orderId`, THE KycV2Service SHALL update the UserSubscription status to `KYC_SUBMITTED`.
+2. IF the UserSubscription status update fails, THEN THE KycV2Service SHALL log the error and continue processing without failing the overall submission.
 
-### Requirement 20: KYC Details Page Declarations Section Update
+### Requirement 11: KYC V2 User Attribute Sync
 
-**User Story:** As a research analyst, I want the declarations section on the KYC details page to reflect the simplified form, so that I do not see declaration checkboxes that the investor was never asked to confirm.
+**User Story:** As a system administrator, I want KYC v2 submission data synced to user attributes on a set-if-empty basis, so that user profile data is populated from KYC without overwriting existing values.
 
 #### Acceptance Criteria
 
-1. WHEN the KYC_Details_Page displays a KYC record submitted via the new single-page form, THE KYC_Details_Page SHALL hide the Declarations & Consent section if no declaration fields (trueInformationDeclared, consentToTermsAndConditions, consentToSelfAttestedDocuments, consentToStartESignature) are populated in the KYC_Metadata
-2. WHEN the KYC_Details_Page displays a legacy KYC record with populated declaration fields, THE KYC_Details_Page SHALL continue to render the full Declarations & Consent section with all four declaration items
+1. WHEN a v2 form submission completes and the KycMetadata contains a `userId`, THE KycV2Service SHALL retrieve the existing user info record.
+2. WHEN the existing user info record has an empty `firstName` field and the v2 `fatherOrSpouseName` is available, THE KycV2Service SHALL NOT overwrite `firstName` with `fatherOrSpouseName` because v2 does not collect the user's own name.
+3. IF the user attribute sync fails, THEN THE KycV2Service SHALL log the error and continue processing without failing the overall submission.
+
+### Requirement 12: KYC V2 RA Approval
+
+**User Story:** As a research analyst, I want to approve a v2 KYC submission, so that the investor's subscription can be activated.
+
+#### Acceptance Criteria
+
+1. WHEN a `KycV2UpdateRequest` with `eventType` KYC_V2_RA_VERIFICATION_COMPLETED is received, THE KycV2Service SHALL retrieve the KycMetadata record using the provided `kycId`.
+2. IF no KycMetadata record exists for the provided `kycId`, THEN THE KycV2Service SHALL return an error response with the message "KYC not found".
+3. WHEN the KycMetadata `subStatus` is `KYC_RA_VERIFICATION_PENDING`, THE KycV2Service SHALL update the `status` to `COMPLETED` and `subStatus` to `KYC_RA_VERIFICATION_SUCCESS`.
+4. WHEN the KycMetadata is updated, THE KycV2Service SHALL set `lastEventType` to `KYC_V2_RA_VERIFICATION_COMPLETED`, `lastUpdatedTime` to the current timestamp, and `kycCompletedTime` to the current timestamp.
+5. WHEN the approval is processed, THE KycV2Service SHALL persist the updated KycMetadata record and create a KYC audit event.
+
+### Requirement 13: KYC V2 RA Rejection
+
+**User Story:** As a research analyst, I want to reject a v2 KYC submission with a reason, so that the investor is informed about what needs to be corrected.
+
+#### Acceptance Criteria
+
+1. WHEN a `KycV2UpdateRequest` with `eventType` KYC_V2_RA_VERIFICATION_FAILED is received, THE KycV2Service SHALL retrieve the KycMetadata record using the provided `kycId`.
+2. IF no KycMetadata record exists for the provided `kycId`, THEN THE KycV2Service SHALL return an error response with the message "KYC not found".
+3. WHEN the KycMetadata `subStatus` is `KYC_RA_VERIFICATION_PENDING`, THE KycV2Service SHALL update the `status` to `REJECTED` and `subStatus` to `KYC_RA_VERIFICATION_FAILED`.
+4. WHEN a `kycRejectionReason` is provided in the request, THE KycV2Service SHALL store the rejection reason on the KycMetadata record.
+5. WHEN the rejection is processed, THE KycV2Service SHALL persist the updated KycMetadata record and create a KYC audit event.
+
+### Requirement 14: Backward Compatibility with Existing KYC V1
+
+**User Story:** As a developer, I want the v2 KYC flow to be completely independent from v1, so that the existing KYC process continues to function without any risk of regression.
+
+#### Acceptance Criteria
+
+1. THE KycV2Model SHALL reside in a separate file (`kycv2.model.ts`) and SHALL NOT modify the existing `kyc.model.ts` file.
+2. THE KycV2Service SHALL reside in a separate file (`kyc-v2-service.ts`) and SHALL NOT modify the existing `kyc-service.ts` file.
+3. THE KycV2Controller SHALL reside in a separate file (`update-kyc-v2-controller.ts`) and SHALL NOT modify the existing `update-kyc-controller.ts` file.
+4. THE KycV2Model SHALL import shared types from `kyc.model.ts` using standard TypeScript import statements without re-exporting or aliasing types that would conflict with v1 consumers.
+5. THE KycV2Service SHALL reuse the existing `KycMetadataDao` for data persistence, storing v2 records in the same DynamoDB table as v1 records.
+6. THE KycV2Service SHALL reuse the existing `KycNotificationService` for dispatching notifications.
