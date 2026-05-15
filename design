@@ -1,431 +1,351 @@
-# Design Document: KYC Single-Page Redesign
+# Design Document: KYC V2 Simplified Form
 
 ## Overview
 
-This design replaces the existing 5-step multi-page KYC flow with a single-page form. The current flow collects personal details, address details, contact/document uploads, and declarations across separate steps with individual API calls per step (`PERSONAL_INFO_SUBMITTED`, `ADDRESS_INFO_SUBMITTED`, `CONTACT_INFO_SUBMITTED`, `DOCUMENTS_SUBMITTED`, `KYC_FORM_SUBMITTED`). The redesign consolidates all fields onto one page and submits everything in a single API call using a new event type `SINGLE_PAGE_KYC_SUBMITTED`.
+This design describes a new, standalone KYC V2 simplified form that operates alongside the existing KYC V1 flow. The V2 form collects a reduced set of fields — PAN Number, Father's/Spouse's Name, Communication Address (free-text or structured), ID Proof document, and Address Proof document — through a single-step submission. The implementation creates three new files (`kycv2.model.ts`, `kyc-v2-service.ts`, `update-kyc-v2-controller.ts`) while leaving all existing V1 code untouched.
 
-The simplified field set is: Phone, Email, First Name, Middle Name, Last Name, PAN Number, State, PAN Card (ID proof), and Address Proof (conditional alternative document upload). All legacy fields (father/spouse name, DOB, gender, marital status, nationality, residential status, occupation, annual income, net worth, PEP status, Aadhaar number, full address breakdown) are dropped from the new form but preserved in the data model for backward compatibility with existing records.
-
-### Key Design Decisions
-
-1. **New event type `SINGLE_PAGE_KYC_SUBMITTED`** rather than reusing `KYC_FORM_SUBMITTED` — this cleanly separates the new single-page submission path from the legacy multi-step path, allowing both to coexist without conditional branching in the existing step handlers.
-
-2. **Reuse existing `KycPersonalInfo`, `AddressInfo`, `KycContactInfo`, `KycDocumentInfo` structures** — the new submission populates these same interfaces with the simplified field set and constructs `fullName` from first/middle/last name parts. Legacy-only fields are left undefined. This means the RA dashboard, eSignature flow, and approval/rejection flows continue working without modification.
-
-3. **Legacy detection via presence of `dateOfBirth` or `gender` in `personalInfo`** — the KYC Details page uses this heuristic to decide whether to render the full legacy layout or the simplified layout. No backend schema changes or version flags are needed.
-
-4. **Reuse `KYC_AADHAR_CARD` presigned URL type for alternative address proof** — the existing Aadhaar bucket (`ipier-kyc-documents`) is reused for storing alternative address proof documents, avoiding new S3 bucket provisioning.
+The V2 flow reuses the existing `KycMetadata` DynamoDB table, DAOs, notification service, invoice generation, and order management. It introduces a simplified validation pipeline that only checks the reduced field set, and maps V2-specific fields into the existing `KycData` structure for downstream compatibility.
 
 ## Architecture
 
-The change touches three layers of the system:
-
 ```mermaid
 graph TD
-    subgraph Frontend ["Frontend (React SPA)"]
-        KF[KYCForm.js - Single Page]
-        KD[KYCDetails.js - RA View]
-    end
-
-    subgraph Backend ["Backend (IPierWebControllers Lambda)"]
-        UC[update-kyc-controller.ts]
-        KS[kyc-service.ts]
-        KNS[kyc-notification-service.ts]
-        KM[kyc.model.ts]
-    end
-
-    subgraph Notification ["Notification Service (Java Lambda)"]
-        SES[SesEmailSender.java]
-        WA1[KycSubmissionWhatsAppBodyBuilder.java]
-        WA2[ESignCompleteWhatsAppBodyBuilder.java]
-    end
-
-    subgraph Storage ["AWS Storage"]
-        DDB[(DynamoDB - KYC Metadata)]
-        S3[(S3 - KYC Documents)]
-        SQS[(SQS - Notification Queue)]
-    end
-
-    KF -->|POST /kyc/update| UC
-    UC -->|SINGLE_PAGE_KYC_SUBMITTED| KS
-    KS --> DDB
-    KS --> S3
-    KS -->|SQS message| SQS
-    SQS --> SES
-    SQS --> WA1
-    SQS --> WA2
-    KD -->|GET /kyc/:id| DDB
+    A[API Gateway] -->|POST /kyc-v2/update| B[update-kyc-v2-controller.ts]
+    B -->|parse & route by eventType| C[KycV2Service]
+    C -->|read/write| D[KycMetadataDao]
+    C -->|audit events| E[KycEventDao]
+    C -->|invoice| F[InvoiceGeneratorService]
+    C -->|notifications| G[KycNotificationService]
+    C -->|order update| H[OrderService]
+    C -->|user sync| I[UserInfoService]
+    C -->|subscription status| J[UserSubscriptionService]
+    D -->|DynamoDB| K[(KYC Metadata Table)]
+    E -->|DynamoDB| L[(KYC Event Table)]
 ```
 
-### Submission Flow
+### Request Flow
 
-```mermaid
-sequenceDiagram
-    participant Investor
-    participant KYCForm
-    participant PresignedURL
-    participant S3
-    participant UpdateKYC
-    participant KycService
-    participant DynamoDB
-    participant SQS
-    participant NotificationLambda
+1. API Gateway receives a `POST` request and invokes the `update-kyc-v2-controller` Lambda.
+2. The controller parses the request body as `KycV2UpdateRequest`, validates required top-level fields (`eventType`, `kycId`), and forwards the `Authorization` header.
+3. Based on `eventType`, the controller delegates to one of three `KycV2Service` methods: `submitV2Form`, `approveKycV2`, or `rejectKycV2`.
+4. The service performs domain validation, state checks, data persistence, and side effects (invoice, notifications, order/subscription updates).
+5. The controller returns a standardized JSON response with CORS headers.
 
-    Investor->>KYCForm: Fill all fields on single page
-    KYCForm->>PresignedURL: Request PAN card upload URL
-    PresignedURL-->>KYCForm: Presigned URL (KYC_PAN_CARD)
-    KYCForm->>S3: Upload PAN card file
-    
-    opt Address mismatch
-        KYCForm->>PresignedURL: Request address proof upload URL
-        PresignedURL-->>KYCForm: Presigned URL (KYC_AADHAR_CARD)
-        KYCForm->>S3: Upload address proof file
-    end
+### Separation from V1
 
-    Investor->>KYCForm: Click "Submit KYC"
-    KYCForm->>UpdateKYC: POST {eventType: SINGLE_PAGE_KYC_SUBMITTED, ...fields}
-    UpdateKYC->>KycService: submitSinglePageKyc(request)
-    KycService->>KycService: Validate all required fields
-    KycService->>KycService: Construct fullName, populate KycData structures
-    KycService->>DynamoDB: Update KYC metadata (status=IN_REVIEW)
-    KycService->>KycService: Generate invoice PDF
-    KycService->>SQS: Send notification message
-    KycService-->>UpdateKYC: {success: true, status: IN_REVIEW}
-    UpdateKYC-->>KYCForm: 200 OK
-    SQS->>NotificationLambda: Process notification
-    NotificationLambda->>NotificationLambda: Send RA email + WhatsApp + client email
-```
+- V2 files are completely independent: no modifications to `kyc.model.ts`, `kyc-service.ts`, or `update-kyc-controller.ts`.
+- V2 imports shared types (enums, interfaces) from `kyc.model.ts` via standard TypeScript imports.
+- V2 records are stored in the same DynamoDB table as V1 records, differentiated by `lastEventType` values using the `KycV2EventType` enum.
 
 ## Components and Interfaces
 
-### 1. Frontend: KYCForm.js (Single-Page Rewrite)
+### 1. KYC V2 Model (`kycv2.model.ts`)
 
-**Current state:** Multi-step form with 4-5 steps, step navigation, per-step API calls.
+**Location:** `IPierWebControllers/lambda/models/kyc/kycv2.model.ts`
 
-**New state:** Single-page form with all fields visible, one "Submit KYC" button, one API call.
+Defines V2-specific types while importing shared types from `kyc.model.ts`:
 
-#### Component Props (unchanged)
-```javascript
-KYCForm = ({
-  onSubmitSuccess, onSubmitError,
-  initialEmail, initialPhone, initialFirstName, initialLastName,
-  contactMethod, kycId, initialKycData, analystContact, orderId
-})
-```
+- **`IdProofDocumentType`** — New enum: `PAN_CARD`, `PASSPORT`, `VOTER_ID`, `DRIVING_LICENSE`
+- **`KycV2EventType`** — New enum: `KYC_V2_FORM_SUBMITTED`, `KYC_V2_RA_VERIFICATION_COMPLETED`, `KYC_V2_RA_VERIFICATION_FAILED`
+- **`KycV2PersonalInfo`** — Interface with `panNumber: string` and `fatherOrSpouseName: string`
+- **`KycV2DocumentInfo`** — Interface with `idProofDocumentType`, `idProofDocumentS3Key`, `addressProofDocumentType`, `addressProofDocumentS3Key`
+- **`KycV2Data`** — Interface aggregating `kycId`, optional `personalInfo` (KycV2PersonalInfo), optional `communicationAddress` (AddressInfo), optional `documentInfo` (KycV2DocumentInfo)
+- **`KycV2UpdateRequest`** — Request interface with `eventType` (KycV2EventType), `kycId`, optional `personalInfo`, optional `communicationAddress`, optional `documentInfo`, optional `kycRejectionReason`, optional `authHeader`
 
-#### Form State (simplified)
-```javascript
-const [formData, setFormData] = useState({
-  phoneNumber: initialPhone || '',
-  email: initialEmail || '',
-  firstName: initialFirstName || '',
-  middleName: '',
-  lastName: initialLastName || '',
-  panNumber: '',
-  state: '',
-  panCardFile: null,           // File object for PAN card
-  panCardS3Key: '',            // S3 key after upload
-  addressMatchesPan: true,     // Checkbox: PAN address matches current address
-  altAddressProofType: '',     // Alternative document type
-  altAddressProofFile: null,   // File object for alt address proof
-  altAddressProofS3Key: '',    // S3 key after upload
-});
-```
+**Imports from `kyc.model.ts`:** `KycStatus`, `KycSubStatus`, `AddressInfo`, `AddressFormat`, `AddressProofDocumentType`, `KycMetadata`, `KycEvent`
 
-#### Validation Rules
-| Field | Rule | Error Message |
-|-------|------|---------------|
-| Phone | `^[6-9]\d{9}$` | "Mobile number must be 10 digits starting with 6-9" |
-| Email | `^[^\s@]+@[^\s@]+\.[^\s@]+$` | "Please enter a valid email address" |
-| First Name | Required, `^[A-Za-z\s]+$` | "First name is required" / "Only letters and spaces allowed" |
-| Middle Name | Optional, `^[A-Za-z\s]*$` | "Only letters and spaces allowed" |
-| Last Name | Required, `^[A-Za-z\s]+$` | "Last name is required" / "Only letters and spaces allowed" |
-| PAN | `^[A-Z]{5}[0-9]{4}[A-Z]{1}$` (auto-uppercase) | "PAN must be in format: ABCDE1234F" |
-| State | Required (dropdown) | "State selection is required" |
-| PAN Card File | Required, JPEG/PNG/PDF, ≤10MB | "ID proof upload is required" / "File must be JPEG, PNG, or PDF under 10MB" |
-| Alt Address Proof | Required when `addressMatchesPan` is false | "Alternative address proof is required" |
+### 2. KYC V2 Controller (`update-kyc-v2-controller.ts`)
 
-#### Submission Payload
+**Location:** `IPierWebControllers/lambda/handlers/kyc/update-kyc-v2-controller.ts`
+
+Lambda handler following the same pattern as `update-kyc-controller.ts`:
+
 ```typescript
-{
-  eventType: 'SINGLE_PAGE_KYC_SUBMITTED',
-  kycId: string,
-  firstName: string,
-  middleName?: string,
-  lastName: string,
-  panNumber: string,
-  state: string,
-  phoneNumber: string,
-  email: string,
-  panCardDocumentS3Key: string,
-  addressMatchesPan: boolean,
-  altAddressProofDocumentType?: string,  // 'UTILITY_BILL' | 'PROPERTY_TAX_RECEIPT' | 'PENSION_PAYMENT_ORDER' | 'EMPLOYER_ACCOMMODATION_LETTER'
-  altAddressProofDocumentS3Key?: string,
-}
+export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult>
 ```
 
-### 2. Backend: kyc.model.ts Updates
+**Routing logic:**
+| eventType | Service Method |
+|---|---|
+| `KYC_V2_FORM_SUBMITTED` | `kycV2Service.submitV2Form(request)` |
+| `KYC_V2_RA_VERIFICATION_COMPLETED` | `kycV2Service.approveKycV2(request)` |
+| `KYC_V2_RA_VERIFICATION_FAILED` | `kycV2Service.rejectKycV2(request)` |
+| anything else | 400 — `"Invalid kyc v2 event"` |
 
-#### New Event Type
-```typescript
-// Add to KycEventType enum
-SINGLE_PAGE_KYC_SUBMITTED = 'SINGLE_PAGE_KYC_SUBMITTED',
-```
+**Error responses:**
+- Missing body → 400 `"Missing request body"`
+- Missing `eventType` or `kycId` → 400 `"Missing eventType and kycId in request body"`
+- Unhandled exception → 500 with error message
+- All responses include `Access-Control-Allow-Origin: *`
 
-#### New Alternative Address Proof Document Types
-```typescript
-// Add to AddressProofDocumentType enum
-PROPERTY_TAX_RECEIPT = 'PROPERTY_TAX_RECEIPT',
-PENSION_PAYMENT_ORDER = 'PENSION_PAYMENT_ORDER',
-EMPLOYER_ACCOMMODATION_LETTER = 'EMPLOYER_ACCOMMODATION_LETTER',
-```
+### 3. KYC V2 Service (`kyc-v2-service.ts`)
 
-#### Extended KycUpdateRequest
-```typescript
-// Add optional fields to KycUpdateRequest interface
-firstName?: string;
-middleName?: string;
-lastName?: string;
-panNumber?: string;
-state?: string;
-phoneNumber?: string;
-email?: string;
-panCardDocumentS3Key?: string;
-addressMatchesPan?: boolean;
-altAddressProofDocumentType?: string;
-altAddressProofDocumentS3Key?: string;
-```
+**Location:** `IPierWebControllers/lambda/service/kyc-v2-service.ts`
 
-### 3. Backend: update-kyc-controller.ts
+**Class:** `KycV2Service` with constructor taking `stage: string`
 
-Add a new case to the switch statement:
-```typescript
-case KycEventType.SINGLE_PAGE_KYC_SUBMITTED:
-    result = await kycService.submitSinglePageKyc(updateRequest);
-    break;
-```
+**Factory:** `createKycV2Service(stage: string): KycV2Service`
 
-### 4. Backend: kyc-service.ts — New `submitSinglePageKyc` Method
+**Dependencies (injected via constructor, same pattern as KycService):**
+- `KycMetadataDao` — read/write KYC metadata
+- `KycEventDao` — write audit events
+- `InvoiceGeneratorService` — generate invoice PDFs
+- `KycNotificationService` — send submission notifications
+- `OrderService` — update order status
+- `AnalystInfoService` — retrieve analyst info
+- `AnalystSubscriptionPlanService` — retrieve subscription plan
+- `UserInfoService` — sync user attributes
+- `UserSubscriptionService` — update subscription status
 
-This method handles the entire single-page submission in one call. It:
+**Public methods:**
 
-1. Validates the KYC is in a valid state (same allowed sub-statuses as `submitDeclarations`)
-2. Validates all required fields are present
-3. Constructs `fullName` from first + middle + last name
-4. Populates `KycPersonalInfo` with `fullName` and `panNumber` (legacy fields left undefined)
-5. Populates `AddressInfo` with `state` only (in `communicationAddress`)
-6. Populates `KycContactInfo` with `email` and `phoneNumber`
-7. Populates `KycDocumentInfo` with PAN card S3 key and address proof logic
-8. Sets status to `IN_REVIEW`, subStatus to `KYC_RA_VERIFICATION_PENDING`
-9. Syncs contact data to userAttributes (same as existing `submitDeclarations`)
-10. Generates invoice, sends notifications, updates order status
-11. Creates audit event
+#### `submitV2Form(request: KycV2UpdateRequest): Promise<any>`
+1. Retrieve `KycMetadata` by `kycId` → error if not found
+2. Validate KYC state allows updates (reuse `canKYCBeUpdated` logic + allowed sub-statuses)
+3. Validate V2 fields:
+   - PAN number: present, non-empty, matches `^[A-Z]{5}[0-9]{4}[A-Z]{1}$`
+   - Father's/Spouse's name: present, non-empty after trim
+   - Communication address: present, `addressFormat` is either `SINGLE_TEXT` or `ITEMIZED_TEXT`; if `SINGLE_TEXT` then `addressText` non-empty after trim; if `ITEMIZED_TEXT` then `addressLine1`, `city`, `state`, `postalCode` non-empty after trim; `country` non-empty in both cases
+   - Document info: all four fields present and valid enum values
+4. Map V2 data into `KycData` on the metadata record:
+   - `personalInfo.panNumber` and `personalInfo.fatherOrSpouseName` → set on `KycData.personalInfo`, other fields left undefined
+   - `communicationAddress` → set on `KycData.communicationAddress`
+   - `documentInfo.idProofDocumentS3Key` → `KycData.documentInfo.panCardDocumentS3Key`
+   - Address proof fields → corresponding `KycData.documentInfo` fields
+5. Update metadata: `status = IN_REVIEW`, `subStatus = KYC_RA_VERIFICATION_PENDING`, `lastEventType = KYC_V2_FORM_SUBMITTED`, `lastUpdatedTime = now`
+6. Retrieve analyst info, subscription plan, order details → generate invoice
+7. Send KYC submitted notification (non-fatal on failure)
+8. Persist metadata via `KycMetadataDao`
+9. Update order status to KYC_SUBMITTED with invoice S3 key
+10. Update `UserSubscription` status to `KYC_SUBMITTED` (non-fatal on failure)
+11. Sync user attributes set-if-empty (non-fatal on failure) — V2 does NOT sync `firstName` since it doesn't collect the user's own name
+12. Create audit event
+13. Return success response
 
-#### Field Mapping to Existing Structures
+#### `approveKycV2(request: KycV2UpdateRequest): Promise<any>`
+1. Retrieve `KycMetadata` by `kycId` → error if not found
+2. Validate `subStatus === KYC_RA_VERIFICATION_PENDING`
+3. Update: `status = COMPLETED`, `subStatus = KYC_RA_VERIFICATION_SUCCESS`, `lastEventType = KYC_V2_RA_VERIFICATION_COMPLETED`, `lastUpdatedTime = now`, `kycCompletedTime = now`
+4. Persist metadata + create audit event
+5. Return success response
 
-```
-firstName + middleName + lastName → KycPersonalInfo.fullName
-panNumber → KycPersonalInfo.panNumber
-state → AddressInfo.state (communicationAddress)
-email → KycContactInfo.email
-phoneNumber → KycContactInfo.phoneNumber
-panCardDocumentS3Key → KycDocumentInfo.panCardDocumentS3Key
-addressMatchesPan → KycDocumentInfo.isAadhaarAddressCurrent
-altAddressProofDocumentS3Key → KycDocumentInfo.aadhaarCardDocumentS3Key
-altAddressProofDocumentType → KycDocumentInfo.addressProofDocumentType
+#### `rejectKycV2(request: KycV2UpdateRequest): Promise<any>`
+1. Retrieve `KycMetadata` by `kycId` → error if not found
+2. Validate `subStatus === KYC_RA_VERIFICATION_PENDING`
+3. Update: `status = REJECTED`, `subStatus = KYC_RA_VERIFICATION_FAILED`, `lastEventType = KYC_V2_RA_VERIFICATION_FAILED`, `lastUpdatedTime = now`
+4. Store `kycRejectionReason` if provided
+5. Persist metadata + create audit event
+6. Return success response
 
-When addressMatchesPan is true:
-  KycDocumentInfo.aadhaarCardDocumentS3Key = panCardDocumentS3Key (copy)
-  KycDocumentInfo.isAadhaarAddressCurrent = true
-```
-
-### 5. Backend: kyc-notification-service.ts Updates
-
-#### `buildKycSubmissionNotificationParams` Changes
-
-**Keep:** orderId, orderSubmissionDateTime, orderLinkForRa, orderLinkForClient, clientPhone, clientEmail, notifyClientByEMAIL, notifyClientBySMS, raWhatsAppNumber, raEmail, raName, planName, clientName, fullName, panNo, panFileBucket, panFileKey, panFileType, aadharFileBucket, aadharFileKey, aadharFileType, invoiceFileBucket, invoiceFileKey, invoiceFileType
-
-**Add:** state (from `communicationAddress.state`)
-
-**Remove:** fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, pep, aadhar, currentAddress
-
-#### `buildEsignCompletedNotificationParams` Changes
-
-Same pattern: keep common fields, add `state`, remove legacy personal info fields.
-
-### 6. Java Notification Service: SesEmailSender.java
-
-#### `sendRaKycSubmitted` Method Changes
-
-**Remove** population of: fatherName, dateOfBirth, gender, maritalStatus, nationality, residentialStatus, occupation, annualIncome, netWorth, pep, aadharLast4, currentAddress, permanentAddress
-
-**Add:** state, clientPhone, clientEmail
-
-**Keep:** fullName, panNo, planName, raName, and all attachment logic
-
-#### `sendRaESignComplete` Method Changes
-
-Same simplification — remove legacy fields, add state.
-
-#### `sendClientKycSubmitted` Method — Minimal Change
-
-Already only uses clientName, orderId, orderLinkForClient. No fields to remove.
-
-### 7. Java Notification Service: WhatsApp Body Builders
-
-**No changes needed.** Both `KycSubmissionWhatsAppBodyBuilder` and `ESignCompleteWhatsAppBodyBuilder` only use `planName`, `orderId`, `fullName`, and `clientPhone` — all of which remain in the simplified notification params. They already have null-safe defaults.
-
-### 8. Frontend: KYCDetails.js Updates
-
-#### Legacy Detection Logic
-```javascript
-const isLegacyKyc = (kycData) => {
-  const pi = kycData?.kycData?.personalInfo;
-  return !!(pi?.dateOfBirth || pi?.gender || pi?.aadhaarNumber);
-};
-```
-
-#### `transformApiDataToDisplayFormat` Changes
-
-Add `isLegacy` flag to the returned object. For simplified records, map only the available fields.
-
-#### Conditional Rendering
-
-- **Personal Info section:** Show full name, PAN, phone (with badge), email (with badge) for simplified. Show all legacy fields for legacy records.
-- **Address section:** Show only state for simplified. Show full correspondence/permanent address for legacy.
-- **Documents section:** Show PAN card and address proof buttons (unchanged).
-- **Declarations section:** Hide entirely for simplified records (no declaration fields populated). Show for legacy records.
-
-### 9. SES Email Templates (AWS SES)
-
-The following SES templates need updating:
-
-| Template | Change |
-|----------|--------|
-| `RaMailOnKycSubmissionTemplate` | Remove legacy field placeholders, add state, keep attachments |
-| `RaMailOnESignCompleteTemplate` | Remove legacy field placeholders, add state, keep attachments |
-| `ClientKycSubmittedEmailTemplate` | No change needed (already uses only clientName, orderId, orderLink) |
-
+**Private validation methods:**
+- `validateV2PersonalInfo(request)` — checks PAN format and father/spouse name
+- `validateV2CommunicationAddress(request)` — checks address format (SINGLE_TEXT or ITEMIZED_TEXT), validates required fields per format, country
+- `validateV2DocumentInfo(request)` — checks all four document fields
+- `validateV2FormData(request)` — orchestrates all three validators, aggregates errors
+- `canKYCBeUpdated(kycMetadata)` — checks status allows updates (same logic as V1)
 
 ## Data Models
 
-### KYC Metadata (DynamoDB) — No Schema Change
-
-The existing `KycMetadata` DynamoDB table schema is unchanged. The new single-page form populates the same `kycData` nested structure with a subset of fields:
+### New Types (kycv2.model.ts)
 
 ```typescript
-// Existing KycMetadata record — populated by single-page form
-{
-  kycId: "kyc-abc123",
-  analystHandle: "analyst-handle",
-  analystId: "analyst-id",
-  subscriptionId: "sub-plan-001",
-  orderId: "order-001",
-  userId: "cognito-sub-uuid",
-  userEmail: "investor@example.com",
-  userPhoneNumber: "+919876543210",
-  contactMethod: "mobile",
-  status: "IN_REVIEW",
-  subStatus: "KYC_RA_VERIFICATION_PENDING",
-  lastEventType: "SINGLE_PAGE_KYC_SUBMITTED",
-  kycStartTime: "20250115120000",
-  lastUpdatedTime: "20250115121500",
-  hashKey: "investor@example.com",
-  sortKey: "20250115##kyc-abc123",
+// V2-specific ID proof types
+enum IdProofDocumentType {
+  PAN_CARD = 'PAN_CARD',
+  PASSPORT = 'PASSPORT',
+  VOTER_ID = 'VOTER_ID',
+  DRIVING_LICENSE = 'DRIVING_LICENSE',
+}
 
-  kycData: {
-    kycId: "kyc-abc123",
-    personalInfo: {
-      fullName: "Avinash Kumar Singh",    // Constructed from first + middle + last
-      panNumber: "ABCDE1234F",
-      // All other fields (fatherOrSpouseName, dateOfBirth, gender, etc.) are undefined
-    },
-    communicationAddress: {
-      state: "Maharashtra",
-      // All other fields (addressLine1, city, postalCode, etc.) are undefined
-    },
-    contactInfo: {
-      email: "investor@example.com",
-      phoneNumber: "9876543210",
-    },
-    documentInfo: {
-      panCardDocumentS3Key: "kyc/pan/kyc-abc123/pan-card.pdf",
-      aadhaarCardDocumentS3Key: "kyc/aadhaar/kyc-abc123/address-proof.pdf",  // Alt doc or copy of PAN key
-      isAadhaarAddressCurrent: true,   // true = PAN address matches
-      addressProofDocumentType: "UTILITY_BILL",  // Only set when address doesn't match
-      addressProofDocumentS3Key: "",
-    },
-    // declarations is undefined for single-page submissions
-  }
+// V2-specific event types
+enum KycV2EventType {
+  KYC_V2_FORM_SUBMITTED = 'KYC_V2_FORM_SUBMITTED',
+  KYC_V2_RA_VERIFICATION_COMPLETED = 'KYC_V2_RA_VERIFICATION_COMPLETED',
+  KYC_V2_RA_VERIFICATION_FAILED = 'KYC_V2_RA_VERIFICATION_FAILED',
+}
+
+// Simplified personal info (only 2 fields vs V1's 13)
+interface KycV2PersonalInfo {
+  panNumber: string;
+  fatherOrSpouseName: string;
+}
+
+// V2 document info with ID proof + address proof
+interface KycV2DocumentInfo {
+  idProofDocumentType: IdProofDocumentType;
+  idProofDocumentS3Key: string;
+  addressProofDocumentType: AddressProofDocumentType; // reused from kyc.model.ts
+  addressProofDocumentS3Key: string;
+}
+
+// Aggregated V2 data
+interface KycV2Data {
+  kycId: string;
+  personalInfo?: KycV2PersonalInfo;
+  communicationAddress?: AddressInfo; // reused from kyc.model.ts
+  documentInfo?: KycV2DocumentInfo;
+}
+
+// V2 update request
+interface KycV2UpdateRequest {
+  eventType: KycV2EventType;
+  kycId: string;
+  personalInfo?: KycV2PersonalInfo;
+  communicationAddress?: AddressInfo;
+  documentInfo?: KycV2DocumentInfo;
+  kycRejectionReason?: string;
+  authHeader?: string;
 }
 ```
 
-### Legacy vs Simplified Record Detection
+### Data Mapping: V2 → KycData (existing structure)
 
-```typescript
-// Heuristic: legacy records have dateOfBirth, gender, or aadhaarNumber populated
-function isLegacyKycRecord(kycData: KycData): boolean {
-  const pi = kycData?.personalInfo;
-  return !!(pi?.dateOfBirth || pi?.gender || pi?.aadhaarNumber);
-}
-```
+When `submitV2Form` persists data, it maps V2 fields into the existing `KycData` structure:
 
-### Frontend Form State → API Payload Mapping
+| V2 Field | KycData Target | Notes |
+|---|---|---|
+| `personalInfo.panNumber` | `kycData.personalInfo.panNumber` | Direct mapping |
+| `personalInfo.fatherOrSpouseName` | `kycData.personalInfo.fatherOrSpouseName` | Direct mapping |
+| `communicationAddress` | `kycData.communicationAddress` | Full AddressInfo with SINGLE_TEXT or ITEMIZED_TEXT format |
+| `documentInfo.idProofDocumentS3Key` | `kycData.documentInfo.panCardDocumentS3Key` | ID proof stored in PAN card slot |
+| `documentInfo.addressProofDocumentType` | `kycData.documentInfo.addressProofDocumentType` | Direct mapping |
+| `documentInfo.addressProofDocumentS3Key` | `kycData.documentInfo.addressProofDocumentS3Key` | Direct mapping |
 
-| Form Field | API Payload Field | Backend Target |
-|------------|-------------------|----------------|
-| `phoneNumber` | `phoneNumber` | `KycContactInfo.phoneNumber` |
-| `email` | `email` | `KycContactInfo.email` |
-| `firstName` | `firstName` | Used to construct `KycPersonalInfo.fullName` |
-| `middleName` | `middleName` | Used to construct `KycPersonalInfo.fullName` |
-| `lastName` | `lastName` | Used to construct `KycPersonalInfo.fullName` |
-| `panNumber` | `panNumber` | `KycPersonalInfo.panNumber` |
-| `state` | `state` | `AddressInfo.state` |
-| `panCardS3Key` | `panCardDocumentS3Key` | `KycDocumentInfo.panCardDocumentS3Key` |
-| `addressMatchesPan` | `addressMatchesPan` | `KycDocumentInfo.isAadhaarAddressCurrent` |
-| `altAddressProofType` | `altAddressProofDocumentType` | `KycDocumentInfo.addressProofDocumentType` |
-| `altAddressProofS3Key` | `altAddressProofDocumentS3Key` | `KycDocumentInfo.aadhaarCardDocumentS3Key` |
+Fields not collected by V2 (aadhaarNumber, fullName, dateOfBirth, gender, etc.) remain `undefined` on the `KycData.personalInfo` object.
 
-### Notification Params (Simplified)
+### DynamoDB Storage
 
-```typescript
-// buildKycSubmissionNotificationParams output for single-page submissions
-{
-  // Order info
-  orderId: string,
-  orderSubmissionDateTime: string,
-  orderLinkForRa: string,
-  orderLinkForClient: string,
+V2 records use the same `KycMetadata` table and key structure as V1:
+- **hashKey:** user email
+- **sortKey:** `DDMMYYYYHHMMSS##kycId`
 
-  // Contact
-  clientPhone: string,
-  clientEmail: string,
-  notifyClientByEMAIL: boolean,
-  notifyClientBySMS: boolean,
-  raWhatsAppNumber: string,
-  raEmail: string,
-  raName: string,
-  planName: string,
+V2 records are distinguishable by their `lastEventType` values (`KYC_V2_FORM_SUBMITTED`, `KYC_V2_RA_VERIFICATION_COMPLETED`, `KYC_V2_RA_VERIFICATION_FAILED`).
 
-  // Personal (simplified)
-  clientName: string,
-  fullName: string,
-  panNo: string,
-  state: string,          // NEW
 
-  // Documents
-  panFileBucket: string,
-  panFileKey: string,
-  panFileType: string,
-  aadharFileBucket: string,
-  aadharFileKey: string,
-  aadharFileType: string,
-  invoiceFileBucket: string,
-  invoiceFileKey: string,
-  invoiceFileType: string,
+## Correctness Properties
 
-  // REMOVED: fatherName, dateOfBirth, gender, maritalStatus, nationality,
-  //          residentialStatus, occupation, annualIncome, pep, aadhar, currentAddress
-}
-```
+*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
 
+### Property 1: PAN number format validation
+
+*For any* string, the PAN validation function should accept it if and only if it matches the regex `^[A-Z]{5}[0-9]{4}[A-Z]{1}$`. Strings with lowercase letters, wrong length, missing digits, or special characters should all be rejected.
+
+**Validates: Requirements 3.1, 3.2, 3.3**
+
+### Property 2: Whitespace-only father/spouse name rejection
+
+*For any* string composed entirely of whitespace characters (spaces, tabs, newlines) or the empty string, the `fatherOrSpouseName` validation should reject it. *For any* string containing at least one non-whitespace character, this validation check should pass.
+
+**Validates: Requirements 4.1, 4.2**
+
+### Property 3: Address validation per format
+
+*For any* `communicationAddress` with `addressFormat === SINGLE_TEXT`, the address validation should reject it if `addressText` is empty/whitespace-only. *For any* `communicationAddress` with `addressFormat === ITEMIZED_TEXT`, the address validation should reject it if any of `addressLine1`, `city`, `state`, or `postalCode` are empty/whitespace-only. In both formats, an empty/missing `country` should be rejected.
+
+**Validates: Requirements 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9**
+
+### Property 4: Document validation error aggregation
+
+*For any* `KycV2DocumentInfo` object where some fields are valid and some are invalid (missing, empty, or not a valid enum value), the validation function should reject the input and the error message should list exactly the fields that are invalid — no more, no less.
+
+**Validates: Requirements 6.2, 6.3, 6.4, 6.5, 6.6**
+
+### Property 5: KYC state gate
+
+*For any* `KycMetadata` record, the `submitV2Form` method should permit updates only when the record's `status` and `subStatus` are in the allowed set. For all other status/subStatus combinations, the method should return an error indicating the KYC is not in a valid state.
+
+**Validates: Requirements 7.3**
+
+### Property 6: V2 to KycData mapping preserves data
+
+*For any* valid `KycV2UpdateRequest`, after mapping V2 fields into the `KycData` structure: (a) `kycData.personalInfo.panNumber` equals the input `panNumber`, (b) `kycData.personalInfo.fatherOrSpouseName` equals the input `fatherOrSpouseName`, (c) all other `KycPersonalInfo` fields are `undefined`, (d) `kycData.communicationAddress` equals the input `communicationAddress`, (e) `kycData.documentInfo.panCardDocumentS3Key` equals the input `idProofDocumentS3Key`, (f) `kycData.documentInfo.addressProofDocumentType` and `addressProofDocumentS3Key` equal the input values.
+
+**Validates: Requirements 7.4, 7.5, 7.6**
+
+### Property 7: CORS headers on every response
+
+*For any* API Gateway request (valid, invalid, missing body, or causing an exception), the controller response should always include the header `Access-Control-Allow-Origin: *`.
+
+**Validates: Requirements 2.9**
+
+### Property 8: Unrecognized event type rejection
+
+*For any* string that is not a valid `KycV2EventType` enum value, the controller should return HTTP status 400 with a body containing `"Invalid kyc v2 event"`.
+
+**Validates: Requirements 2.8**
+
+## Error Handling
+
+### Controller-Level Errors
+
+| Condition | HTTP Status | Response Body |
+|---|---|---|
+| Missing request body | 400 | `{ "message": "Missing request body" }` |
+| Missing `eventType` or `kycId` | 400 | `{ "message": "Missing eventType and kycId in request body" }` |
+| Unrecognized `eventType` | 400 | `{ "message": "Invalid kyc v2 event" }` |
+| Unhandled exception | 500 | `{ "message": "<error.message>" }` |
+
+All error responses include CORS headers.
+
+### Service-Level Errors
+
+| Condition | Response |
+|---|---|
+| KYC not found | `{ success: false, error: "KYC not found" }` |
+| KYC in invalid state | `{ success: false, error: "KYC is not in a valid state to submit" }` |
+| Validation failure | `{ success: false, error: "The following fields are mandatory: <field list>" }` |
+| PAN format invalid | `{ success: false, error: "PAN number format is invalid. Expected format: ABCDE1234F" }` |
+| Analyst not found | Throws `"Analyst not found"` (caught by controller → 500) |
+
+### Non-Fatal Side Effects
+
+The following operations are wrapped in try/catch and log errors without failing the submission:
+- Notification dispatch (`sendKycSubmittedNotification`)
+- User subscription status update (`updateUserSubscriptionStatus`)
+- User attribute sync (`updateUserInfoPartial`)
+
+This matches the V1 pattern where these side effects are non-fatal.
+
+## Testing Strategy
+
+### Property-Based Tests (fast-check)
+
+The project already uses `fast-check` for property-based testing. Each property from the Correctness Properties section maps to a single property-based test with a minimum of 100 iterations.
+
+| Property | Test Target | Generator Strategy |
+|---|---|---|
+| Property 1: PAN format | `validateV2PersonalInfo` | `fc.string()` — verify acceptance iff matches PAN regex |
+| Property 2: Whitespace name | `validateV2PersonalInfo` | `fc.stringOf(fc.constantFrom(' ', '\t', '\n', '\r'))` for rejection; `fc.string().filter(s => s.trim().length > 0)` for acceptance |
+| Property 3: Address validation | `validateV2CommunicationAddress` | Generate SINGLE_TEXT with whitespace addressText for rejection; generate ITEMIZED_TEXT with missing fields for rejection; verify correct field-specific errors |
+| Property 4: Document error aggregation | `validateV2DocumentInfo` | Generate `KycV2DocumentInfo` with random valid/invalid field combinations; verify error lists exactly the invalid fields |
+| Property 5: State gate | `canKYCBeUpdated` + status check | Generate random `KycMetadata` with all possible status/subStatus combinations; verify only allowed set passes |
+| Property 6: Data mapping | `submitV2Form` mapping logic | Generate random valid `KycV2UpdateRequest`; verify mapped `KycData` fields match input and uncollected fields are undefined |
+| Property 7: CORS headers | Controller handler | Generate random request shapes (valid, invalid, missing body); verify CORS header present |
+| Property 8: Event type rejection | Controller handler | `fc.string().filter(s => !Object.values(KycV2EventType).includes(s))` — verify 400 response |
+
+**Tag format:** `Feature: kyc-v2-simplified-form, Property {N}: {title}`
+
+### Unit Tests (Jest)
+
+Example-based tests for specific scenarios:
+
+- **Controller routing:** One test per valid `eventType` verifying correct service method is called
+- **Missing body / missing fields:** Edge case tests for 400 responses
+- **Authorization header forwarding:** Verify `authHeader` is populated from request headers
+- **KYC not found:** Mock DAO returning null, verify error response
+- **Analyst not found:** Mock service returning null, verify exception
+- **Successful submission:** Full happy path with all mocks, verify response shape and all side effects called
+- **Approval flow:** Verify status transitions to COMPLETED/KYC_RA_VERIFICATION_SUCCESS
+- **Rejection flow:** Verify status transitions to REJECTED/KYC_RA_VERIFICATION_FAILED, rejection reason stored
+- **Non-fatal side effects:** Mock notification/subscription/user-sync services to throw, verify submission still succeeds
+- **V2 does not sync firstName:** Verify user attribute sync never sets firstName from V2 data
+
+### Integration Tests
+
+Not in scope for this feature — V2 reuses existing DAO and service infrastructure that is already integration-tested via V1.
+
+### Test File Locations
+
+- `IPierWebControllers/test/kyc-v2-service.test.ts` — Service unit tests + property tests
+- `IPierWebControllers/test/update-kyc-v2-controller.test.ts` — Controller unit tests + property tests
+- `IPierWebControllers/test/kycv2-model.test.ts` — Model smoke tests (optional, compiler covers most)
